@@ -249,6 +249,15 @@ namespace HairUnlocker
         static void UnlockHair()
         {
             if (!settings.UnlockHair) return;
+
+            // Allow human female characters to use human male hairstyles.
+            // Deliberately limited to Human FemaleOptions: other races and male options are unchanged.
+            var human = ResourcesLibrary.TryGetBlueprint<BlueprintRace>("0a5d473ead98b0646b94495af250fdc4");
+            if (human != null && human.MaleOptions != null && human.FemaleOptions != null)
+            {
+                human.FemaleOptions.Hair = Combine(human.MaleOptions.Hair, human.FemaleOptions.Hair);
+            }
+
             BlueprintRace[][] groups;
             if (settings.UnlockAllHair)
             {
