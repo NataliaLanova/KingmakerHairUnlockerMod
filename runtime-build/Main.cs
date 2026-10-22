@@ -53,7 +53,6 @@ namespace HairUnlocker
                 modEntry.OnToggle = OnToggle;
                 modEntry.OnUpdate = OnUpdate;
                 SceneManager.sceneLoaded += OnSceneLoaded;
-                InstallBuildMeshPatch();
                 InstallSkeletonModifierPatch();
                 Log("Loaded. Female human characters can use human male hairstyles; incompatible male-hair skeleton modifiers are suppressed for female characters during skeleton setup.");
                 return true;
