@@ -23,6 +23,14 @@ namespace HairUnlocker
         private static bool hairNamesReady;
         private static readonly HashSet<string> maleHairEntityNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static readonly List<MeshSwap> meshSwaps = new List<MeshSwap>();
+        private static readonly List<ModifierSwap> modifierSwaps = new List<ModifierSwap>();
+        private static bool skeletonModifierPatchInstalled;
+
+        private sealed class ModifierSwap
+        {
+            public IList Collection;
+            public object[] Original;
+        }
 
         private sealed class MeshSwap
         {
@@ -46,7 +54,8 @@ namespace HairUnlocker
                 modEntry.OnUpdate = OnUpdate;
                 SceneManager.sceneLoaded += OnSceneLoaded;
                 InstallBuildMeshPatch();
-                Log("Loaded. This patch gives human female characters access to human male hairstyles and includes a first-pass mesh-bind repair.");
+                InstallSkeletonModifierPatch();
+                Log("Loaded. Female human characters can use human male hairstyles; incompatible male-hair skeleton modifiers are suppressed for female characters during skeleton setup.");
                 return true;
             }
             catch (Exception ex)
@@ -618,6 +627,159 @@ namespace HairUnlocker
                 DestroyUnityObject(swap.ClonedMesh);
             }
             meshSwaps.Clear();
+        }
+
+
+        private static void InstallSkeletonModifierPatch()
+        {
+            if (skeletonModifierPatchInstalled) return;
+            try
+            {
+                Type characterType = FindType("Kingmaker.Visual.CharacterSystem.Character");
+                if (characterType == null)
+                {
+                    Log("Character type not found; hairstyle skeleton-modifier repair is unavailable.");
+                    return;
+                }
+
+                MethodInfo target = characterType.GetMethod("CacheSkeletonBones", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (target == null)
+                {
+                    Log("Character.CacheSkeletonBones was not found; hairstyle skeleton-modifier repair is unavailable.");
+                    return;
+                }
+
+                Type harmonyMethodType = FindType("HarmonyLib.HarmonyMethod");
+                Type harmonyType = FindType("HarmonyLib.Harmony");
+                bool harmonyV2 = harmonyType != null;
+                if (harmonyType == null)
+                    harmonyType = FindType("HarmonyLib.HarmonyInstance");
+                if (harmonyMethodType == null || harmonyType == null)
+                {
+                    Log("Harmony API was not found; hairstyle skeleton-modifier repair is unavailable.");
+                    return;
+                }
+
+                MethodInfo prefix = typeof(Main).GetMethod("CacheSkeletonBonesPrefix", BindingFlags.Static | BindingFlags.NonPublic);
+                MethodInfo postfix = typeof(Main).GetMethod("CacheSkeletonBonesPostfix", BindingFlags.Static | BindingFlags.NonPublic);
+                MethodInfo finalizer = typeof(Main).GetMethod("CacheSkeletonBonesFinalizer", BindingFlags.Static | BindingFlags.NonPublic);
+                object prefixHarmony = Activator.CreateInstance(harmonyMethodType, new object[] { prefix });
+                object postfixHarmony = Activator.CreateInstance(harmonyMethodType, new object[] { postfix });
+                object finalizerHarmony = Activator.CreateInstance(harmonyMethodType, new object[] { finalizer });
+
+                object harmony;
+                if (harmonyV2)
+                {
+                    harmony = Activator.CreateInstance(harmonyType, new object[] { "openai.human-female-male-hairstyles.skeletonmodifiers" });
+                }
+                else
+                {
+                    MethodInfo create = harmonyType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                        .FirstOrDefault(m => m.Name == "Create" && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType == typeof(string));
+                    if (create == null)
+                    {
+                        Log("HarmonyInstance.Create was not found; hairstyle skeleton-modifier repair is unavailable.");
+                        return;
+                    }
+                    harmony = create.Invoke(null, new object[] { "openai.human-female-male-hairstyles.skeletonmodifiers" });
+                }
+
+                MethodInfo patchMethod = harmonyType.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    .Where(m => m.Name == "Patch")
+                    .OrderByDescending(m => m.GetParameters().Length)
+                    .FirstOrDefault(m => {
+                        ParameterInfo[] p = m.GetParameters();
+                        return p.Length >= 4 && typeof(MethodBase).IsAssignableFrom(p[0].ParameterType);
+                    });
+                if (patchMethod == null)
+                {
+                    Log("Harmony Patch method was not found; hairstyle skeleton-modifier repair is unavailable.");
+                    return;
+                }
+
+                ParameterInfo[] patchParameters = patchMethod.GetParameters();
+                object[] args = new object[patchParameters.Length];
+                args[0] = target;
+                args[1] = prefixHarmony;
+                args[2] = postfixHarmony;
+                if (args.Length > 3) args[3] = null;
+                if (args.Length > 4) args[4] = finalizerHarmony;
+                patchMethod.Invoke(harmony, args);
+                skeletonModifierPatchInstalled = true;
+                Log("Installed Character.CacheSkeletonBones repair hook.");
+            }
+            catch (Exception ex)
+            {
+                LogError(ex);
+            }
+        }
+
+        private static void CacheSkeletonBonesPrefix(object __instance)
+        {
+            RestoreModifierSwaps();
+            if (!enabled || !hairNamesReady || __instance == null) return;
+
+            try
+            {
+                object gender = ReadMember(__instance, "m_RuntimeGender");
+                if (gender == null || !string.Equals(gender.ToString(), "Female", StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                IEnumerable entities = ReadMember(__instance, "m_EquipmentEntities") as IEnumerable;
+                if (entities == null) return;
+
+                foreach (object entity in entities)
+                {
+                    if (entity == null) continue;
+                    object nameValue = ReadMember(entity, "name");
+                    string entityName = nameValue == null ? "" : nameValue.ToString();
+                    if (!maleHairEntityNames.Contains(entityName)) continue;
+
+                    IList modifiers = ReadMember(entity, "SkeletonModifiers") as IList;
+                    if (modifiers == null || modifiers.Count == 0) continue;
+
+                    object[] original = new object[modifiers.Count];
+                    modifiers.CopyTo(original, 0);
+                    modifiers.Clear();
+                    modifierSwaps.Add(new ModifierSwap { Collection = modifiers, Original = original });
+                    Log("Temporarily suppressed " + original.Length + " skeleton modifier(s) on " + entityName + " for a female character.");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogError(ex);
+                RestoreModifierSwaps();
+            }
+        }
+
+        private static void CacheSkeletonBonesPostfix()
+        {
+            RestoreModifierSwaps();
+        }
+
+        private static Exception CacheSkeletonBonesFinalizer(Exception __exception)
+        {
+            RestoreModifierSwaps();
+            return __exception;
+        }
+
+        private static void RestoreModifierSwaps()
+        {
+            for (int i = modifierSwaps.Count - 1; i >= 0; i--)
+            {
+                ModifierSwap swap = modifierSwaps[i];
+                try
+                {
+                    swap.Collection.Clear();
+                    foreach (object modifier in swap.Original)
+                        swap.Collection.Add(modifier);
+                }
+                catch (Exception ex)
+                {
+                    LogError(ex);
+                }
+            }
+            modifierSwaps.Clear();
         }
 
         private static void Log(string message)
