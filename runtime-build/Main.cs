@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Linq;
 using UnityModManagerNet;
 using UnityEngine.SceneManagement;
 
@@ -18,6 +19,23 @@ namespace HairUnlocker
         private static object humanFemaleOptions;
         private static Array originalFemaleHair;
         private static bool applied;
+        private static bool meshPatchInstalled;
+        private static bool hairNamesReady;
+        private static readonly HashSet<string> maleHairEntityNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly List<MeshSwap> meshSwaps = new List<MeshSwap>();
+
+        private sealed class MeshSwap
+        {
+            public object Renderer;
+            public object OriginalMesh;
+            public object ClonedMesh;
+        }
+
+        private sealed class BindPoseCandidate
+        {
+            public object Value;
+            public int Priority;
+        }
 
         public static bool Load(UnityModManager.ModEntry modEntry)
         {
@@ -27,7 +45,8 @@ namespace HairUnlocker
                 modEntry.OnToggle = OnToggle;
                 modEntry.OnUpdate = OnUpdate;
                 SceneManager.sceneLoaded += OnSceneLoaded;
-                Log("Loaded. This patch gives human female characters access to human male hairstyles.");
+                InstallBuildMeshPatch();
+                Log("Loaded. This patch gives human female characters access to human male hairstyles and includes a first-pass mesh-bind repair.");
                 return true;
             }
             catch (Exception ex)
@@ -137,6 +156,7 @@ namespace HairUnlocker
                 return;
             }
 
+            CacheMaleHairEntityNames(maleHair);
             Array combined = CombineHair(femaleHair, maleHair);
             if (combined.Length == femaleHair.Length)
             {
@@ -271,6 +291,333 @@ namespace HairUnlocker
                 return true;
             }
             return false;
+        }
+
+
+        // Install without a compile-time reference to Harmony so this patch can build
+        // independently of the exact Harmony assembly used by the player's UMM install.
+        private static void InstallBuildMeshPatch()
+        {
+            if (meshPatchInstalled) return;
+            try
+            {
+                Type characterType = FindType("Kingmaker.Visual.CharacterSystem.Character");
+                if (characterType == null)
+                {
+                    Log("Character type not found; mesh-bind repair is unavailable on this game build.");
+                    return;
+                }
+
+                MethodInfo target = null;
+                foreach (MethodInfo candidate in characterType.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                {
+                    if (candidate.Name != "BuildMesh") continue;
+                    ParameterInfo[] parameters = candidate.GetParameters();
+                    if (parameters.Length == 1 && parameters[0].ParameterType.Name.Contains("Dictionary"))
+                    {
+                        target = candidate;
+                        break;
+                    }
+                }
+                if (target == null)
+                {
+                    Log("Character.BuildMesh was not found; hairstyle access will still work, but mesh-bind repair is unavailable.");
+                    return;
+                }
+
+                Type harmonyMethodType = FindType("HarmonyLib.HarmonyMethod");
+                Type harmonyType = FindType("HarmonyLib.Harmony");
+                bool harmonyV2 = harmonyType != null;
+                if (harmonyType == null)
+                    harmonyType = FindType("HarmonyLib.HarmonyInstance");
+                if (harmonyMethodType == null || harmonyType == null)
+                {
+                    Log("Harmony API was not found; hairstyle access will still work, but mesh-bind repair is unavailable.");
+                    return;
+                }
+
+                MethodInfo prefix = typeof(Main).GetMethod("BuildMeshPrefix", BindingFlags.Static | BindingFlags.NonPublic);
+                MethodInfo postfix = typeof(Main).GetMethod("BuildMeshPostfix", BindingFlags.Static | BindingFlags.NonPublic);
+                MethodInfo finalizer = typeof(Main).GetMethod("BuildMeshFinalizer", BindingFlags.Static | BindingFlags.NonPublic);
+                object prefixHarmony = Activator.CreateInstance(harmonyMethodType, new object[] { prefix });
+                object postfixHarmony = Activator.CreateInstance(harmonyMethodType, new object[] { postfix });
+                object finalizerHarmony = Activator.CreateInstance(harmonyMethodType, new object[] { finalizer });
+
+                object harmony;
+                if (harmonyV2)
+                {
+                    harmony = Activator.CreateInstance(harmonyType, new object[] { "openai.human-female-male-hairstyles.bindpose" });
+                }
+                else
+                {
+                    MethodInfo create = harmonyType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                        .FirstOrDefault(m => m.Name == "Create" && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType == typeof(string));
+                    if (create == null)
+                    {
+                        Log("HarmonyInstance.Create was not found; mesh-bind repair is unavailable.");
+                        return;
+                    }
+                    harmony = create.Invoke(null, new object[] { "openai.human-female-male-hairstyles.bindpose" });
+                }
+
+                MethodInfo patchMethod = harmonyType.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    .Where(m => m.Name == "Patch")
+                    .OrderByDescending(m => m.GetParameters().Length)
+                    .FirstOrDefault(m => {
+                        ParameterInfo[] p = m.GetParameters();
+                        return p.Length >= 4 && typeof(MethodBase).IsAssignableFrom(p[0].ParameterType);
+                    });
+                if (patchMethod == null)
+                {
+                    Log("Harmony Patch method was not found; mesh-bind repair is unavailable.");
+                    return;
+                }
+
+                ParameterInfo[] patchParameters = patchMethod.GetParameters();
+                object[] args = new object[patchParameters.Length];
+                args[0] = target;
+                args[1] = prefixHarmony;
+                args[2] = postfixHarmony;
+                if (args.Length > 3) args[3] = null;
+                if (args.Length > 4) args[4] = finalizerHarmony;
+                patchMethod.Invoke(harmony, args);
+                meshPatchInstalled = true;
+                Log("Installed Character.BuildMesh mesh-bind repair.");
+            }
+            catch (Exception ex)
+            {
+                LogError(ex);
+            }
+        }
+
+        private static void CacheMaleHairEntityNames(Array maleHair)
+        {
+            if (hairNamesReady || maleHair == null) return;
+
+            int found = 0;
+            foreach (object link in maleHair)
+            {
+                if (link == null) continue;
+                object entity = LoadEquipmentEntity(link);
+                object nameValue = ReadMember(entity, "name");
+                string entityName = nameValue == null ? null : nameValue.ToString();
+                if (!string.IsNullOrEmpty(entityName))
+                {
+                    maleHairEntityNames.Add(entityName);
+                    found++;
+                }
+            }
+
+            if (found > 0)
+            {
+                hairNamesReady = true;
+                Log("Cached " + maleHairEntityNames.Count + " male human hairstyle model names for mesh repair.");
+            }
+        }
+
+        private static object LoadEquipmentEntity(object link)
+        {
+            if (link == null) return null;
+            try
+            {
+                MethodInfo load = link.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    .FirstOrDefault(m => m.Name == "Load" && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType == typeof(bool));
+                if (load != null) return load.Invoke(link, new object[] { false });
+
+                load = link.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    .FirstOrDefault(m => m.Name == "Load" && m.GetParameters().Length == 0);
+                return load == null ? null : load.Invoke(link, null);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static void BuildMeshPrefix(object __instance, object __0)
+        {
+            RestoreMeshSwaps();
+            if (!enabled || !hairNamesReady || maleHairEntityNames.Count == 0 || __instance == null || __0 == null)
+                return;
+
+            try
+            {
+                object gender = ReadMember(__instance, "m_RuntimeGender");
+                object race = ReadMember(__instance, "m_RuntimeRace");
+                if (gender == null || !string.Equals(gender.ToString(), "Female", StringComparison.OrdinalIgnoreCase))
+                    return;
+                if (race != null && !string.Equals(race.ToString(), "Human", StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                IDictionary parts = __0 as IDictionary;
+                if (parts == null || parts.Count == 0) return;
+
+                // A female reference bind pose is taken from existing non-male-hair parts.
+                // Prefer the head EE for head/neck/jaw bones, and the body EE for torso bones.
+                var reference = new Dictionary<string, BindPoseCandidate>(StringComparer.OrdinalIgnoreCase);
+                foreach (DictionaryEntry entry in parts)
+                {
+                    object ee = entry.Value;
+                    if (ee == null) continue;
+                    string eeName = ReadMember(ee, "name") == null ? "" : ReadMember(ee, "name").ToString();
+                    if (maleHairEntityNames.Contains(eeName)) continue;
+
+                    object part = entry.Key;
+                    object renderer = ReadMember(part, "SkinnedRenderer");
+                    object mesh = ReadMember(renderer, "sharedMesh");
+                    Array bones = ReadMember(renderer, "bones") as Array;
+                    Array bindposes = ReadMember(mesh, "bindposes") as Array;
+                    if (bones == null || bindposes == null) continue;
+
+                    int count = Math.Min(bones.Length, bindposes.Length);
+                    for (int i = 0; i < count; i++)
+                    {
+                        object bone = bones.GetValue(i);
+                        object boneNameValue = ReadMember(bone, "name");
+                        if (boneNameValue == null || bindposes.GetValue(i) == null) continue;
+                        string boneName = boneNameValue.ToString();
+                        int priority = GetBindPosePriority(eeName, boneName);
+
+                        BindPoseCandidate existing;
+                        if (!reference.TryGetValue(boneName, out existing) || priority > existing.Priority)
+                        {
+                            reference[boneName] = new BindPoseCandidate { Value = bindposes.GetValue(i), Priority = priority };
+                        }
+                    }
+                }
+                if (reference.Count == 0) return;
+
+                foreach (DictionaryEntry entry in parts)
+                {
+                    object ee = entry.Value;
+                    if (ee == null) continue;
+                    string eeName = ReadMember(ee, "name") == null ? "" : ReadMember(ee, "name").ToString();
+                    if (!maleHairEntityNames.Contains(eeName)) continue;
+
+                    object renderer = ReadMember(entry.Key, "SkinnedRenderer");
+                    object originalMesh = ReadMember(renderer, "sharedMesh");
+                    Array bones = ReadMember(renderer, "bones") as Array;
+                    Array bindposes = ReadMember(originalMesh, "bindposes") as Array;
+                    if (renderer == null || originalMesh == null || bones == null || bindposes == null) continue;
+
+                    Array adjusted = (Array)bindposes.Clone();
+                    int matched = 0;
+                    int changed = 0;
+                    int count = Math.Min(bones.Length, adjusted.Length);
+                    for (int i = 0; i < count; i++)
+                    {
+                        object boneNameValue = ReadMember(bones.GetValue(i), "name");
+                        if (boneNameValue == null) continue;
+                        BindPoseCandidate target;
+                        if (!reference.TryGetValue(boneNameValue.ToString(), out target)) continue;
+                        matched++;
+                        object previous = adjusted.GetValue(i);
+                        if (previous != null && !previous.Equals(target.Value))
+                        {
+                            adjusted.SetValue(target.Value, i);
+                            changed++;
+                        }
+                    }
+                    if (matched < 2 || changed == 0) continue;
+
+                    object clone = CloneUnityObject(originalMesh);
+                    if (clone == null || !WriteMember(clone, "bindposes", adjusted))
+                    {
+                        DestroyUnityObject(clone);
+                        continue;
+                    }
+
+                    meshSwaps.Add(new MeshSwap { Renderer = renderer, OriginalMesh = originalMesh, ClonedMesh = clone });
+                    if (!WriteMember(renderer, "sharedMesh", clone))
+                    {
+                        meshSwaps.RemoveAt(meshSwaps.Count - 1);
+                        DestroyUnityObject(clone);
+                        continue;
+                    }
+                    Log("Adjusted " + eeName + " using " + changed + " female bind pose(s).");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogError(ex);
+            }
+        }
+
+        private static int GetBindPosePriority(string eeName, string boneName)
+        {
+            string ee = eeName ?? "";
+            string bone = boneName ?? "";
+            bool headBone = bone.IndexOf("head", StringComparison.OrdinalIgnoreCase) >= 0
+                || bone.IndexOf("neck", StringComparison.OrdinalIgnoreCase) >= 0
+                || bone.IndexOf("jaw", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool hairBone = bone.IndexOf("hair", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (hairBone)
+                return ee.IndexOf("Hair", StringComparison.OrdinalIgnoreCase) >= 0 ? 90 : 10;
+            if (headBone)
+            {
+                if (ee.IndexOf("Head", StringComparison.OrdinalIgnoreCase) >= 0) return 90;
+                if (ee.IndexOf("Body", StringComparison.OrdinalIgnoreCase) >= 0) return 50;
+                return 20;
+            }
+            if (ee.IndexOf("Body", StringComparison.OrdinalIgnoreCase) >= 0
+                || ee.IndexOf("Skin", StringComparison.OrdinalIgnoreCase) >= 0)
+                return 80;
+            if (ee.IndexOf("Head", StringComparison.OrdinalIgnoreCase) >= 0)
+                return 30;
+            return 10;
+        }
+
+        private static object CloneUnityObject(object source)
+        {
+            if (source == null) return null;
+            Type unityObject = FindType("UnityEngine.Object");
+            if (unityObject == null) return null;
+            MethodInfo instantiate = unityObject.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                .FirstOrDefault(m => m.Name == "Instantiate" && !m.IsGenericMethod
+                    && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType == unityObject);
+            return instantiate == null ? null : instantiate.Invoke(null, new object[] { source });
+        }
+
+        private static void DestroyUnityObject(object value)
+        {
+            if (value == null) return;
+            try
+            {
+                Type unityObject = FindType("UnityEngine.Object");
+                if (unityObject == null) return;
+                MethodInfo destroy = unityObject.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .FirstOrDefault(m => m.Name == "Destroy" && m.GetParameters().Length == 1
+                        && m.GetParameters()[0].ParameterType == unityObject);
+                if (destroy != null) destroy.Invoke(null, new object[] { value });
+            }
+            catch { }
+        }
+
+        private static void BuildMeshPostfix()
+        {
+            RestoreMeshSwaps();
+        }
+
+        private static Exception BuildMeshFinalizer(Exception __exception)
+        {
+            RestoreMeshSwaps();
+            return __exception;
+        }
+
+        private static void RestoreMeshSwaps()
+        {
+            for (int i = meshSwaps.Count - 1; i >= 0; i--)
+            {
+                MeshSwap swap = meshSwaps[i];
+                try
+                {
+                    WriteMember(swap.Renderer, "sharedMesh", swap.OriginalMesh);
+                }
+                catch { }
+                DestroyUnityObject(swap.ClonedMesh);
+            }
+            meshSwaps.Clear();
         }
 
         private static void Log(string message)
