@@ -3,7 +3,7 @@
     <TargetFramework>net472</TargetFramework>
     <LangVersion>latest</LangVersion>
     <OutputType>Library</OutputType>
-    <AssemblyName>HairUnlocker</AssemblyName>
+    <AssemblyName>HumanFemaleMaleHairstyles</AssemblyName>
     <RootNamespace>HairUnlocker</RootNamespace>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <OutputPath>bin\Release\</OutputPath>
