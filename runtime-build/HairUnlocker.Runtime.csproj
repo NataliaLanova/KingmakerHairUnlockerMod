@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <OutputType>Library</OutputType>
+    <AssemblyName>HairUnlocker</AssemblyName>
+    <RootNamespace>HairUnlocker</RootNamespace>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <OutputPath>bin\Release\</OutputPath>
+    <GameManagedPath Condition="'$(GameManagedPath)' == ''">$(MSBuildProjectDirectory)\..\..\vendor\game-root\Kingmaker_Data\Managed</GameManagedPath>
+    <UMMPath Condition="'$(UMMPath)' == ''">$(MSBuildProjectDirectory)\..\..\vendor\UnityModManager.dll</UMMPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="UnityModManager">
+      <HintPath>$(UMMPath)</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(GameManagedPath)\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+  <Target Name="CheckReferences" BeforeTargets="ResolveReferences">
+    <Error Condition="!Exists('$(UMMPath)')" Text="UnityModManager.dll not found. Check UMMPath." />
+    <Error Condition="!Exists('$(GameManagedPath)\UnityEngine.CoreModule.dll')" Text="UnityEngine.CoreModule.dll not found. Check GameManagedPath." />
+  </Target>
+</Project>
