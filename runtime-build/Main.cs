@@ -25,6 +25,7 @@ namespace HairUnlocker
             {
                 logger = modEntry.Logger;
                 modEntry.OnToggle = OnToggle;
+                modEntry.OnUpdate = OnUpdate;
                 SceneManager.sceneLoaded += OnSceneLoaded;
                 Log("Loaded. This patch gives human female characters access to human male hairstyles.");
                 return true;
@@ -53,6 +54,21 @@ namespace HairUnlocker
             return true;
         }
 
+        private static void OnUpdate(UnityModManager.ModEntry modEntry, float dt)
+        {
+            if (!enabled) return;
+            try
+            {
+                // Another mod may rebuild Human FemaleOptions during the main menu.
+                // Re-apply only when one or more male hairstyle links are missing.
+                Apply();
+            }
+            catch (Exception ex)
+            {
+                LogError(ex);
+            }
+        }
+
         private static void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
             if (!enabled || scene.name != MainMenuSceneName)
@@ -70,7 +86,7 @@ namespace HairUnlocker
 
         private static void Apply()
         {
-            if (!enabled || applied)
+            if (!enabled)
                 return;
 
             object game = GetStaticProperty(FindType("Kingmaker.Game"), "Instance");
@@ -121,14 +137,19 @@ namespace HairUnlocker
                 return;
             }
 
-            if (!originalCaptured)
+            Array combined = CombineHair(femaleHair, maleHair);
+            if (combined.Length == femaleHair.Length)
             {
-                humanFemaleOptions = femaleOptions;
-                originalFemaleHair = (Array)femaleHair.Clone();
-                originalCaptured = true;
+                applied = true;
+                return;
             }
 
-            Array combined = CombineHair(femaleHair, maleHair);
+            // Snapshot the current list immediately before extending it. This also
+            // preserves changes made by the original Hair Unlocker or other mods.
+            humanFemaleOptions = femaleOptions;
+            originalFemaleHair = (Array)femaleHair.Clone();
+            originalCaptured = true;
+
             if (!WriteMember(femaleOptions, "Hair", combined))
             {
                 Log("Could not update Human FemaleOptions.Hair; this game version may store the list differently.");
@@ -137,7 +158,7 @@ namespace HairUnlocker
 
             applied = true;
             Log("Applied: human female characters can now select male human hairstyles (" +
-                originalFemaleHair.Length + " original, " + combined.Length + " total).");
+                originalFemaleHair.Length + " current, " + combined.Length + " total).");
         }
 
         private static Array CombineHair(Array femaleHair, Array maleHair)
@@ -172,8 +193,11 @@ namespace HairUnlocker
             if (originalCaptured && humanFemaleOptions != null && originalFemaleHair != null)
             {
                 if (WriteMember(humanFemaleOptions, "Hair", originalFemaleHair))
-                    Log("Restored the original human female hairstyle list.");
+                    Log("Restored the previous human female hairstyle list.");
             }
+            humanFemaleOptions = null;
+            originalFemaleHair = null;
+            originalCaptured = false;
             applied = false;
         }
 
