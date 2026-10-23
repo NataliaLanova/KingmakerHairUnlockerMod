@@ -569,12 +569,6 @@ namespace HairUnlocker
                 if (count == 0 || sourceBones.Length != sourceBindposes.Length || sourceBones.Length != __3.Length)
                     return true;
 
-                object animator = ReadMember(__instance, "m_Animator");
-                Transform meshRoot = ReadMember(animator, "transform") as Transform;
-                if (meshRoot == null)
-                    meshRoot = ReadMember(__instance, "transform") as Transform;
-                if (meshRoot == null) return true;
-
                 Transform fallback = FindFallbackHairBone(__4);
                 if (fallback == null) return true;
 
@@ -603,7 +597,7 @@ namespace HairUnlocker
                 for (int i = 0; i < count; i++)
                 {
                     Transform target = targets[i];
-                    Matrix4x4 retargetedBindpose = target.worldToLocalMatrix * meshRoot.localToWorldMatrix;
+                    Matrix4x4 retargetedBindpose = target.worldToLocalMatrix * renderer.transform.localToWorldMatrix;
                     int mappedIndex = -1;
 
                     for (int j = 0; j < __1.Count; j++)
