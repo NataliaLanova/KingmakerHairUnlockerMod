@@ -572,11 +572,11 @@ namespace HairUnlocker
                 Transform fallback = FindFallbackHairBone(__4);
                 if (fallback == null) return true;
 
-                // Resolve every mapping before mutating the lists. Exact name matches
-                // keep normal animation; missing male-only hair bones use their nearest
-                // ancestor available on the female rig, preserving the strand's rest shape.
-                Transform[] targets = new Transform[count];
-                int remapped = 0;
+                // Preserve each source bind pose. Missing male-only bones are recreated
+                // beneath the closest matching female ancestor at their original world
+                // transforms instead of collapsing a whole strand onto Head/Neck.
+                int clonedOrResolved = 0;
+                int fallbackCount = 0;
                 for (int i = 0; i < count; i++)
                 {
                     Transform source = sourceBones[i];
@@ -584,41 +584,42 @@ namespace HairUnlocker
                     if (source != null)
                         __4.TryGetValue(source.name, out target);
 
+                    if (target == null && source != null)
+                    {
+                        bool usedFallback;
+                        target = GetOrCreateHairBone(source, __4, fallback, out usedFallback);
+                        clonedOrResolved++;
+                        if (usedFallback) fallbackCount++;
+                    }
+
                     if (target == null)
                     {
-                        target = FindNearestExistingAncestor(source, __4);
-                        if (target == null)
-                            target = fallback;
-                        remapped++;
+                        target = fallback;
+                        fallbackCount++;
                     }
-                    targets[i] = target;
-                }
 
-                for (int i = 0; i < count; i++)
-                {
-                    Transform target = targets[i];
-                    Matrix4x4 retargetedBindpose = target.worldToLocalMatrix * renderer.transform.localToWorldMatrix;
+                    // Keep the source bind pose unchanged; cloned bones are placed at the
+                    // source's world pose so this bind pose remains valid for the mesh.
                     int mappedIndex = -1;
-
                     for (int j = 0; j < __1.Count; j++)
                     {
-                        if (__1[j] == target && __2[j].Equals(retargetedBindpose))
+                        if (__1[j] == target && __2[j].Equals(sourceBindposes[i]))
                         {
                             mappedIndex = j;
                             break;
                         }
                     }
-
                     if (mappedIndex < 0)
                     {
                         mappedIndex = __1.Count;
                         __1.Add(target);
-                        __2.Add(retargetedBindpose);
+                        __2.Add(sourceBindposes[i]);
                     }
                     __3[i] = mappedIndex;
                 }
 
-                Log("Retargeted male-hair bones; remapped " + remapped + " of " + count + " source bone(s) to the female skeleton.");
+                Log("Preserved male-hair bind poses and resolved " + clonedOrResolved +
+                    " bone(s); direct fallback used for " + fallbackCount + ".");
                 return false;
             }
             catch (Exception ex)
@@ -626,6 +627,73 @@ namespace HairUnlocker
                 LogError(ex);
                 return true;
             }
+        }
+
+        private static Transform GetOrCreateHairBone(Transform source,
+            Dictionary<string, Transform> cachedBones, Transform fallback, out bool usedFallback)
+        {
+            usedFallback = false;
+            if (source == null) return null;
+
+            Transform existing;
+            if (cachedBones.TryGetValue(source.name, out existing) && existing != null)
+                return existing;
+
+            var missingChain = new List<Transform>();
+            Transform sourceAncestor = source.parent;
+            Transform targetAncestor = null;
+
+            while (sourceAncestor != null)
+            {
+                if (cachedBones.TryGetValue(sourceAncestor.name, out targetAncestor) && targetAncestor != null)
+                    break;
+                missingChain.Add(sourceAncestor);
+                sourceAncestor = sourceAncestor.parent;
+            }
+
+            if (targetAncestor == null)
+            {
+                // If this asset uses a completely separate hierarchy, anchor only this
+                // bone to Head/Neck. Subsequent child bones can still link to this clone.
+                targetAncestor = fallback;
+                missingChain.Clear();
+                usedFallback = true;
+            }
+
+            missingChain.Reverse();
+            missingChain.Add(source);
+            Transform parent = targetAncestor;
+
+            foreach (Transform sourceNode in missingChain)
+            {
+                if (sourceNode == null) continue;
+                if (cachedBones.TryGetValue(sourceNode.name, out existing) && existing != null)
+                {
+                    parent = existing;
+                    continue;
+                }
+
+                var go = new GameObject(sourceNode.name);
+                Transform clone = go.transform;
+                clone.SetParent(parent, true);
+                clone.position = sourceNode.position;
+                clone.rotation = sourceNode.rotation;
+
+                Vector3 desiredScale = sourceNode.lossyScale;
+                Vector3 parentScale = parent == null ? Vector3.one : parent.lossyScale;
+                clone.localScale = new Vector3(
+                    Mathf.Abs(parentScale.x) > 0.0001f ? desiredScale.x / parentScale.x : desiredScale.x,
+                    Mathf.Abs(parentScale.y) > 0.0001f ? desiredScale.y / parentScale.y : desiredScale.y,
+                    Mathf.Abs(parentScale.z) > 0.0001f ? desiredScale.z / parentScale.z : desiredScale.z);
+
+                cachedBones[sourceNode.name] = clone;
+                parent = clone;
+            }
+
+            Transform result;
+            if (cachedBones.TryGetValue(source.name, out result) && result != null)
+                return result;
+            return fallback;
         }
 
         private static bool IsFemaleHumanCharacter(object character)
