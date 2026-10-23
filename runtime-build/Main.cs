@@ -698,8 +698,8 @@ namespace HairUnlocker
             return __exception;
         }
 
-        private static bool RepairMissingHairBonesPrefix(object __instance, object __0,
-            List<Transform> __1, List<Matrix4x4> __2, int[] __3, Dictionary<string, Transform> __4)
+        private static bool RepairMissingHairBonesPrefix(object __instance, object __0, object __1,
+            List<Transform> __2, List<Matrix4x4> __3, int[] __4, Dictionary<string, Transform> __5)
         {
             if (!enabled || __instance == null || __0 == null ||
                 !activeMaleHairParts.Any(part => object.ReferenceEquals(part, __0)) ||
@@ -710,16 +710,16 @@ namespace HairUnlocker
             {
                 object rendererValue = ReadMember(__0, "SkinnedRenderer");
                 SkinnedMeshRenderer renderer = rendererValue as SkinnedMeshRenderer;
-                if (renderer == null || renderer.sharedMesh == null || __4 == null || __4.Count == 0)
+                if (renderer == null || renderer.sharedMesh == null || __4 == null || __4.Length == 0)
                     return true;
 
                 Transform[] sourceBones = renderer.bones;
                 Matrix4x4[] sourceBindposes = renderer.sharedMesh.bindposes;
-                int count = Math.Min(Math.Min(sourceBones.Length, sourceBindposes.Length), __3.Length);
-                if (count == 0 || sourceBones.Length != sourceBindposes.Length || sourceBones.Length != __3.Length)
+                int count = Math.Min(Math.Min(sourceBones.Length, sourceBindposes.Length), __4.Length);
+                if (count == 0 || sourceBones.Length != sourceBindposes.Length || sourceBones.Length != __4.Length)
                     return true;
 
-                Transform fallback = FindFallbackHairBone(__4);
+                Transform fallback = FindFallbackHairBone(__5);
                 if (fallback == null) return true;
 
                 // Preserve each source bind pose. Missing male-only bones are recreated
@@ -732,12 +732,12 @@ namespace HairUnlocker
                     Transform source = sourceBones[i];
                     Transform target = null;
                     if (source != null)
-                        __4.TryGetValue(source.name, out target);
+                        __5.TryGetValue(source.name, out target);
 
                     if (target == null && source != null)
                     {
                         bool usedFallback;
-                        target = GetOrCreateHairBone(source, __4, fallback, out usedFallback);
+                        target = GetOrCreateHairBone(source, __5, fallback, out usedFallback);
                         clonedOrResolved++;
                         if (usedFallback) fallbackCount++;
                     }
@@ -751,9 +751,9 @@ namespace HairUnlocker
                     // Keep the source bind pose unchanged; cloned bones are placed at the
                     // source's world pose so this bind pose remains valid for the mesh.
                     int mappedIndex = -1;
-                    for (int j = 0; j < __1.Count; j++)
+                    for (int j = 0; j < __2.Count; j++)
                     {
-                        if (__1[j] == target && __2[j].Equals(sourceBindposes[i]))
+                        if (__2[j] == target && __3[j].Equals(sourceBindposes[i]))
                         {
                             mappedIndex = j;
                             break;
@@ -761,11 +761,11 @@ namespace HairUnlocker
                     }
                     if (mappedIndex < 0)
                     {
-                        mappedIndex = __1.Count;
-                        __1.Add(target);
-                        __2.Add(sourceBindposes[i]);
+                        mappedIndex = __2.Count;
+                        __2.Add(target);
+                        __3.Add(sourceBindposes[i]);
                     }
-                    __3[i] = mappedIndex;
+                    __4[i] = mappedIndex;
                 }
 
                 Log("Preserved male-hair bind poses and resolved " + clonedOrResolved +
