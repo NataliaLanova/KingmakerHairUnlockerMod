@@ -518,10 +518,10 @@ namespace HairUnlocker
 
             int call = ++rigidBuildMeshCallCount;
             bool trace = call <= 40;
-            string genderText = ReadMember(__instance, "m_RuntimeGender") == null
-                ? "<null>" : ReadMember(__instance, "m_RuntimeGender").ToString();
-            string raceText = ReadMember(__instance, "m_RuntimeRace") == null
-                ? "<null>" : ReadMember(__instance, "m_RuntimeRace").ToString();
+            string runtimeGenderText = SafeMemberString(__instance, "m_RuntimeGender");
+            string runtimeRaceText = SafeMemberString(__instance, "m_RuntimeRace");
+            string genderText = SafeMemberString(__instance, "Gender");
+            string raceText = SafeMemberString(__instance, "Race");
             string argType = __0 == null ? "<null>" : __0.GetType().FullName;
 
             if (trace)
@@ -896,13 +896,36 @@ namespace HairUnlocker
             return fallback;
         }
 
+        private static string SafeMemberString(object target, string name)
+        {
+            try
+            {
+                object value = ReadMember(target, name);
+                return value == null ? "<null>" : value.ToString();
+            }
+            catch (Exception ex)
+            {
+                return "<error:" + ex.GetType().Name + ">";
+            }
+        }
+
         private static bool IsFemaleHumanCharacter(object character)
         {
-            object gender = ReadMember(character, "m_RuntimeGender");
-            object race = ReadMember(character, "m_RuntimeRace");
-            return gender != null && race != null
-                && string.Equals(gender.ToString(), "Female", StringComparison.OrdinalIgnoreCase)
-                && string.Equals(race.ToString(), "Human", StringComparison.OrdinalIgnoreCase);
+            if (character == null) return false;
+
+            // Kingmaker 2.1.7 uses Character.Gender/Race; the m_RuntimeGender and
+            // m_RuntimeRace fields present in later Owlcat games do not exist here.
+            string gender = SafeMemberString(character, "Gender");
+            if (string.Equals(gender, "Female", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            // Compatibility fallbacks for variants/mods exposing the serialized field.
+            gender = SafeMemberString(character, "m_Gender");
+            if (string.Equals(gender, "Female", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            gender = SafeMemberString(character, "<Gender>k__BackingField");
+            return string.Equals(gender, "Female", StringComparison.OrdinalIgnoreCase);
         }
 
         private static Transform FindNearestExistingAncestor(Transform source, Dictionary<string, Transform> cachedBones)
