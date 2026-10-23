@@ -29,6 +29,7 @@ namespace HairUnlocker
         private static bool hairRigPatchInstalled;
         private static readonly List<object> activeMaleHairParts = new List<object>();
         private static readonly List<RigidHairSwap> rigidHairSwaps = new List<RigidHairSwap>();
+        private static int rigidBuildMeshCallCount;
 
         private sealed class RigidHairSwap
         {
@@ -513,13 +514,35 @@ namespace HairUnlocker
         private static void RigidBindMaleHairPrefix(object __instance, object __0)
         {
             RestoreRigidHairSwaps();
-            if (!enabled || !hairNamesReady || maleHairEntityNames.Count == 0 || !IsFemaleHumanCharacter(__instance) || __0 == null)
+            if (!enabled) return;
+
+            int call = ++rigidBuildMeshCallCount;
+            bool trace = call <= 40;
+            string genderText = ReadMember(__instance, "m_RuntimeGender") == null
+                ? "<null>" : ReadMember(__instance, "m_RuntimeGender").ToString();
+            string raceText = ReadMember(__instance, "m_RuntimeRace") == null
+                ? "<null>" : ReadMember(__instance, "m_RuntimeRace").ToString();
+            string argType = __0 == null ? "<null>" : __0.GetType().FullName;
+
+            if (trace)
+                Log("BuildMesh diagnostic #" + call + ": gender=" + genderText +
+                    ", race=" + raceText + ", argument=" + argType +
+                    ", cachedMaleHairNames=" + maleHairEntityNames.Count +
+                    ", hairNamesReady=" + hairNamesReady + ".");
+
+            if (!hairNamesReady || maleHairEntityNames.Count == 0 ||
+                !IsFemaleHumanCharacter(__instance) || __0 == null)
                 return;
 
             try
             {
                 IDictionary parts = __0 as IDictionary;
-                if (parts == null || parts.Count == 0) return;
+                if (parts == null || parts.Count == 0)
+                {
+                    if (trace)
+                        Log("BuildMesh diagnostic #" + call + ": argument was not a populated IDictionary.");
+                    return;
+                }
 
                 Transform head = FindFemaleHeadBone(__instance);
                 if (head == null)
@@ -528,6 +551,8 @@ namespace HairUnlocker
                     return;
                 }
 
+                int matchingMaleHairNames = 0;
+                int rendererCount = 0;
                 foreach (DictionaryEntry entry in parts)
                 {
                     if (entry.Key == null || entry.Value == null) continue;
@@ -535,8 +560,15 @@ namespace HairUnlocker
                     string entityName = nameValue == null ? "" : nameValue.ToString();
                     if (!maleHairEntityNames.Contains(entityName)) continue;
 
+                    matchingMaleHairNames++;
                     SkinnedMeshRenderer renderer = ReadMember(entry.Key, "SkinnedRenderer") as SkinnedMeshRenderer;
-                    if (renderer == null || renderer.sharedMesh == null) continue;
+                    if (renderer == null || renderer.sharedMesh == null)
+                    {
+                        if (trace)
+                            Log("Matched male hairstyle '" + entityName + "' but its body part has no SkinnedRenderer/sharedMesh.");
+                        continue;
+                    }
+                    rendererCount++;
 
                     Mesh original = renderer.sharedMesh;
                     Mesh clone = null;
@@ -585,6 +617,24 @@ namespace HairUnlocker
                             UnityEngine.Object.Destroy(clone);
                         throw;
                     }
+                }
+
+                if (trace && matchingMaleHairNames == 0)
+                {
+                    string sampleNames = string.Join(", ", parts.Values.Cast<object>()
+                        .Where(value => value != null)
+                        .Select(value => {
+                            object name = ReadMember(value, "name");
+                            return name == null ? value.GetType().Name : name.ToString();
+                        })
+                        .Take(10).ToArray());
+                    Log("BuildMesh diagnostic #" + call + ": female/human candidate had " + parts.Count +
+                        " parts but 0 entity-name matches among cached male hairstyles. Sample names: " + sampleNames);
+                }
+                else if (trace && matchingMaleHairNames > 0 && rendererCount == 0)
+                {
+                    Log("BuildMesh diagnostic #" + call + ": matched " + matchingMaleHairNames +
+                        " male hair entity name(s), but none had a usable renderer.");
                 }
             }
             catch (Exception ex)
