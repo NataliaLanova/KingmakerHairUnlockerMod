@@ -28,6 +28,16 @@ namespace HairUnlocker
         private static bool skeletonModifierPatchInstalled;
         private static bool hairRigPatchInstalled;
         private static readonly List<object> activeMaleHairParts = new List<object>();
+        private static readonly List<RigidHairSwap> rigidHairSwaps = new List<RigidHairSwap>();
+
+        private sealed class RigidHairSwap
+        {
+            public SkinnedMeshRenderer Renderer;
+            public Mesh OriginalMesh;
+            public Mesh ClonedMesh;
+            public Transform[] OriginalBones;
+            public Transform OriginalRootBone;
+        }
 
         private sealed class ModifierSwap
         {
@@ -416,28 +426,18 @@ namespace HairUnlocker
                 Type characterType = FindType("Kingmaker.Visual.CharacterSystem.Character");
                 if (characterType == null)
                 {
-                    Log("Character type not found; cross-gender hair rig repair is unavailable.");
+                    Log("Character type not found; rigid hair compatibility mode is unavailable.");
                     return;
                 }
 
-                MethodInfo buildMesh = null;
-                foreach (MethodInfo candidate in characterType.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
-                {
-                    if (candidate.Name != "BuildMesh") continue;
-                    ParameterInfo[] parameters = candidate.GetParameters();
-                    if (parameters.Length == 1 && parameters[0].ParameterType.Name.Contains("Dictionary"))
-                    {
-                        buildMesh = candidate;
-                        break;
-                    }
-                }
+                MethodInfo buildMesh = characterType.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    .FirstOrDefault(candidate => candidate.Name == "BuildMesh" &&
+                        candidate.GetParameters().Length == 1 &&
+                        candidate.GetParameters()[0].ParameterType.Name.Contains("Dictionary"));
 
-                MethodInfo ensureBones = characterType.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                    .FirstOrDefault(m => m.Name == "EnsureBones" && m.GetParameters().Length == 5);
-
-                if (buildMesh == null || ensureBones == null)
+                if (buildMesh == null)
                 {
-                    Log("BuildMesh or EnsureBones was not found; hairstyle access will work, but bone retargeting is unavailable on this game build.");
+                    Log("Character.BuildMesh was not found; rigid hair compatibility mode is unavailable.");
                     return;
                 }
 
@@ -446,41 +446,37 @@ namespace HairUnlocker
                 bool harmonyV2 = harmonyType != null;
                 if (harmonyType == null)
                     harmonyType = FindType("HarmonyLib.HarmonyInstance");
-
                 if (harmonyMethodType == null || harmonyType == null)
                 {
-                    Log("Harmony API was not found; cross-gender hair rig repair is unavailable.");
+                    Log("Harmony API was not found; rigid hair compatibility mode is unavailable.");
                     return;
                 }
 
                 object harmony;
                 if (harmonyV2)
                 {
-                    harmony = Activator.CreateInstance(harmonyType, new object[] { "com.natalialanova.human-female-male-hairstyles.rig-retarget" });
+                    harmony = Activator.CreateInstance(harmonyType, new object[] { "com.natalialanova.human-female-male-hairstyles.rigid-hair" });
                 }
                 else
                 {
                     MethodInfo create = harmonyType.GetMethods(BindingFlags.Public | BindingFlags.Static)
-                        .FirstOrDefault(m => m.Name == "Create" && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType == typeof(string));
+                        .FirstOrDefault(m => m.Name == "Create" && m.GetParameters().Length == 1 &&
+                            m.GetParameters()[0].ParameterType == typeof(string));
                     if (create == null)
                     {
-                        Log("HarmonyInstance.Create was not found; cross-gender hair rig repair is unavailable.");
+                        Log("HarmonyInstance.Create was not found; rigid hair compatibility mode is unavailable.");
                         return;
                     }
-                    harmony = create.Invoke(null, new object[] { "com.natalialanova.human-female-male-hairstyles.rig-retarget" });
+                    harmony = create.Invoke(null, new object[] { "com.natalialanova.human-female-male-hairstyles.rigid-hair" });
                 }
 
                 PatchWithHarmony(harmonyType, harmonyMethodType, harmony, buildMesh,
-                    typeof(Main).GetMethod("PrepareMaleHairPartsPrefix", BindingFlags.Static | BindingFlags.NonPublic),
-                    typeof(Main).GetMethod("ClearActiveMaleHairPartsPostfix", BindingFlags.Static | BindingFlags.NonPublic),
-                    typeof(Main).GetMethod("ClearActiveMaleHairPartsFinalizer", BindingFlags.Static | BindingFlags.NonPublic));
-
-                PatchWithHarmony(harmonyType, harmonyMethodType, harmony, ensureBones,
-                    typeof(Main).GetMethod("RepairMissingHairBonesPrefix", BindingFlags.Static | BindingFlags.NonPublic),
-                    null, null);
+                    typeof(Main).GetMethod("RigidBindMaleHairPrefix", BindingFlags.Static | BindingFlags.NonPublic),
+                    typeof(Main).GetMethod("RigidBindMaleHairPostfix", BindingFlags.Static | BindingFlags.NonPublic),
+                    typeof(Main).GetMethod("RigidBindMaleHairFinalizer", BindingFlags.Static | BindingFlags.NonPublic));
 
                 hairRigPatchInstalled = true;
-                Log("Installed BuildMesh/EnsureBones hooks for cross-gender hair rig retargeting.");
+                Log("Installed rigid hair compatibility hook. Cross-gender male hair is temporarily bound to the female head to prevent rig-induced curling.");
             }
             catch (Exception ex)
             {
@@ -512,6 +508,160 @@ namespace HairUnlocker
             if (args.Length > 3) args[3] = null;
             if (args.Length > 4) args[4] = finalizerHarmony;
             patchMethod.Invoke(harmony, args);
+        }
+
+        private static void RigidBindMaleHairPrefix(object __instance, object __0)
+        {
+            RestoreRigidHairSwaps();
+            if (!enabled || !hairNamesReady || maleHairEntityNames.Count == 0 || !IsFemaleHumanCharacter(__instance) || __0 == null)
+                return;
+
+            try
+            {
+                IDictionary parts = __0 as IDictionary;
+                if (parts == null || parts.Count == 0) return;
+
+                Transform head = FindFemaleHeadBone(__instance);
+                if (head == null)
+                {
+                    Log("Could not locate the female head bone; no hair meshes were changed.");
+                    return;
+                }
+
+                foreach (DictionaryEntry entry in parts)
+                {
+                    if (entry.Key == null || entry.Value == null) continue;
+                    object nameValue = ReadMember(entry.Value, "name");
+                    string entityName = nameValue == null ? "" : nameValue.ToString();
+                    if (!maleHairEntityNames.Contains(entityName)) continue;
+
+                    SkinnedMeshRenderer renderer = ReadMember(entry.Key, "SkinnedRenderer") as SkinnedMeshRenderer;
+                    if (renderer == null || renderer.sharedMesh == null) continue;
+
+                    Mesh original = renderer.sharedMesh;
+                    Mesh clone = null;
+                    try
+                    {
+                        clone = UnityEngine.Object.Instantiate(original);
+                        clone.name = original.name + "_HumanFemaleMaleHair_Rigid";
+
+                        Matrix4x4 bindPose = head.worldToLocalMatrix * renderer.transform.localToWorldMatrix;
+                        clone.bindposes = new Matrix4x4[] { bindPose };
+
+                        BoneWeight[] weights = clone.boneWeights;
+                        for (int i = 0; i < weights.Length; i++)
+                        {
+                            BoneWeight weight = weights[i];
+                            weight.boneIndex0 = 0;
+                            weight.weight0 = 1f;
+                            weight.boneIndex1 = 0;
+                            weight.weight1 = 0f;
+                            weight.boneIndex2 = 0;
+                            weight.weight2 = 0f;
+                            weight.boneIndex3 = 0;
+                            weight.weight3 = 0f;
+                            weights[i] = weight;
+                        }
+                        clone.boneWeights = weights;
+
+                        rigidHairSwaps.Add(new RigidHairSwap
+                        {
+                            Renderer = renderer,
+                            OriginalMesh = original,
+                            ClonedMesh = clone,
+                            OriginalBones = renderer.bones,
+                            OriginalRootBone = renderer.rootBone
+                        });
+
+                        renderer.sharedMesh = clone;
+                        renderer.bones = new Transform[] { head };
+                        renderer.rootBone = head;
+                        Log("Rigid-bound male hairstyle '" + entityName + "' to female head for assembly; " +
+                            weights.Length + " vertices are protected from cross-gender bone mismatch.");
+                    }
+                    catch
+                    {
+                        if (clone != null)
+                            UnityEngine.Object.Destroy(clone);
+                        throw;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogError(ex);
+                RestoreRigidHairSwaps();
+            }
+        }
+
+        private static Transform FindFemaleHeadBone(object character)
+        {
+            Transform root = ReadMember(character, "transform") as Transform;
+            if (root == null) return null;
+
+            Transform best = null;
+            int bestPriority = -1;
+            foreach (Transform candidate in root.GetComponentsInChildren<Transform>(true))
+            {
+                if (candidate == null) continue;
+                string name = candidate.name ?? "";
+                if (name.IndexOf("hair", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("jaw", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("helmet", StringComparison.OrdinalIgnoreCase) >= 0)
+                    continue;
+
+                int priority = 0;
+                if (string.Equals(name, "Head", StringComparison.OrdinalIgnoreCase)) priority = 100;
+                else if (string.Equals(name, "Bip001 Head", StringComparison.OrdinalIgnoreCase)) priority = 95;
+                else if (name.EndsWith(" Head", StringComparison.OrdinalIgnoreCase)) priority = 90;
+                else if (name.IndexOf("Head", StringComparison.OrdinalIgnoreCase) >= 0) priority = 60;
+
+                if (priority > bestPriority)
+                {
+                    bestPriority = priority;
+                    best = candidate;
+                }
+            }
+            return bestPriority > 0 ? best : null;
+        }
+
+        private static void RigidBindMaleHairPostfix()
+        {
+            RestoreRigidHairSwaps();
+        }
+
+        private static Exception RigidBindMaleHairFinalizer(Exception __exception)
+        {
+            RestoreRigidHairSwaps();
+            return __exception;
+        }
+
+        private static void RestoreRigidHairSwaps()
+        {
+            for (int i = rigidHairSwaps.Count - 1; i >= 0; i--)
+            {
+                RigidHairSwap swap = rigidHairSwaps[i];
+                try
+                {
+                    if (swap.Renderer != null)
+                    {
+                        swap.Renderer.sharedMesh = swap.OriginalMesh;
+                        swap.Renderer.bones = swap.OriginalBones;
+                        swap.Renderer.rootBone = swap.OriginalRootBone;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogError(ex);
+                }
+                try
+                {
+                    if (swap.ClonedMesh != null)
+                        UnityEngine.Object.Destroy(swap.ClonedMesh);
+                }
+                catch { }
+            }
+            rigidHairSwaps.Clear();
         }
 
         private static void PrepareMaleHairPartsPrefix(object __instance, object __0)
