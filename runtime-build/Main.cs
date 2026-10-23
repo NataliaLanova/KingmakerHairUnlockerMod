@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Linq;
 using UnityModManagerNet;
 using UnityEngine.SceneManagement;
+using UnityEngine;
 
 namespace HairUnlocker
 {
@@ -25,6 +26,8 @@ namespace HairUnlocker
         private static readonly List<MeshSwap> meshSwaps = new List<MeshSwap>();
         private static readonly List<ModifierSwap> modifierSwaps = new List<ModifierSwap>();
         private static bool skeletonModifierPatchInstalled;
+        private static bool hairRigPatchInstalled;
+        private static readonly List<object> activeMaleHairParts = new List<object>();
 
         private sealed class ModifierSwap
         {
@@ -53,8 +56,8 @@ namespace HairUnlocker
                 modEntry.OnToggle = OnToggle;
                 modEntry.OnUpdate = OnUpdate;
                 SceneManager.sceneLoaded += OnSceneLoaded;
-                InstallSkeletonModifierPatch();
-                Log("Loaded. Female human characters can use human male hairstyles; incompatible male-hair skeleton modifiers are suppressed for female characters during skeleton setup.");
+                InstallHairRigPatch();
+                Log("Loaded. Female human male hairstyles are retargeted during mesh assembly, including bones missing from the female rig.");
                 return true;
             }
             catch (Exception ex)
@@ -396,6 +399,282 @@ namespace HairUnlocker
             {
                 LogError(ex);
             }
+        }
+
+
+        // Pathfinder's character mesh builder stops mapping a part at the first bone
+        // name missing from the current rig. Male long-hair assets can contain bones
+        // absent from the female rig; all later indices then retain the default map.
+        // Patch EnsureBones for those hair parts and map each bone to the best matching
+        // female bone (or nearest available ancestor), rebuilding bind poses against the
+        // female character's current skeleton.
+        private static void InstallHairRigPatch()
+        {
+            if (hairRigPatchInstalled) return;
+            try
+            {
+                Type characterType = FindType("Kingmaker.Visual.CharacterSystem.Character");
+                if (characterType == null)
+                {
+                    Log("Character type not found; cross-gender hair rig repair is unavailable.");
+                    return;
+                }
+
+                MethodInfo buildMesh = null;
+                foreach (MethodInfo candidate in characterType.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                {
+                    if (candidate.Name != "BuildMesh") continue;
+                    ParameterInfo[] parameters = candidate.GetParameters();
+                    if (parameters.Length == 1 && parameters[0].ParameterType.Name.Contains("Dictionary"))
+                    {
+                        buildMesh = candidate;
+                        break;
+                    }
+                }
+
+                MethodInfo ensureBones = characterType.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    .FirstOrDefault(m => m.Name == "EnsureBones" && m.GetParameters().Length == 5);
+
+                if (buildMesh == null || ensureBones == null)
+                {
+                    Log("BuildMesh or EnsureBones was not found; hairstyle access will work, but bone retargeting is unavailable on this game build.");
+                    return;
+                }
+
+                Type harmonyMethodType = FindType("HarmonyLib.HarmonyMethod");
+                Type harmonyType = FindType("HarmonyLib.Harmony");
+                bool harmonyV2 = harmonyType != null;
+                if (harmonyType == null)
+                    harmonyType = FindType("HarmonyLib.HarmonyInstance");
+
+                if (harmonyMethodType == null || harmonyType == null)
+                {
+                    Log("Harmony API was not found; cross-gender hair rig repair is unavailable.");
+                    return;
+                }
+
+                object harmony;
+                if (harmonyV2)
+                {
+                    harmony = Activator.CreateInstance(harmonyType, new object[] { "com.natalialanova.human-female-male-hairstyles.rig-retarget" });
+                }
+                else
+                {
+                    MethodInfo create = harmonyType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                        .FirstOrDefault(m => m.Name == "Create" && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType == typeof(string));
+                    if (create == null)
+                    {
+                        Log("HarmonyInstance.Create was not found; cross-gender hair rig repair is unavailable.");
+                        return;
+                    }
+                    harmony = create.Invoke(null, new object[] { "com.natalialanova.human-female-male-hairstyles.rig-retarget" });
+                }
+
+                PatchWithHarmony(harmonyType, harmonyMethodType, harmony, buildMesh,
+                    typeof(Main).GetMethod("PrepareMaleHairPartsPrefix", BindingFlags.Static | BindingFlags.NonPublic),
+                    typeof(Main).GetMethod("ClearActiveMaleHairPartsPostfix", BindingFlags.Static | BindingFlags.NonPublic),
+                    typeof(Main).GetMethod("ClearActiveMaleHairPartsFinalizer", BindingFlags.Static | BindingFlags.NonPublic));
+
+                PatchWithHarmony(harmonyType, harmonyMethodType, harmony, ensureBones,
+                    typeof(Main).GetMethod("RepairMissingHairBonesPrefix", BindingFlags.Static | BindingFlags.NonPublic),
+                    null, null);
+
+                hairRigPatchInstalled = true;
+                Log("Installed BuildMesh/EnsureBones hooks for cross-gender hair rig retargeting.");
+            }
+            catch (Exception ex)
+            {
+                LogError(ex);
+            }
+        }
+
+        private static void PatchWithHarmony(Type harmonyType, Type harmonyMethodType, object harmony,
+            MethodInfo target, MethodInfo prefix, MethodInfo postfix, MethodInfo finalizer)
+        {
+            MethodInfo patchMethod = harmonyType.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                .Where(m => m.Name == "Patch")
+                .OrderByDescending(m => m.GetParameters().Length)
+                .FirstOrDefault(m => {
+                    ParameterInfo[] p = m.GetParameters();
+                    return p.Length >= 4 && typeof(MethodBase).IsAssignableFrom(p[0].ParameterType);
+                });
+            if (patchMethod == null)
+                throw new MissingMethodException(harmonyType.FullName, "Patch");
+
+            object prefixHarmony = prefix == null ? null : Activator.CreateInstance(harmonyMethodType, new object[] { prefix });
+            object postfixHarmony = postfix == null ? null : Activator.CreateInstance(harmonyMethodType, new object[] { postfix });
+            object finalizerHarmony = finalizer == null ? null : Activator.CreateInstance(harmonyMethodType, new object[] { finalizer });
+            ParameterInfo[] patchParameters = patchMethod.GetParameters();
+            object[] args = new object[patchParameters.Length];
+            args[0] = target;
+            if (args.Length > 1) args[1] = prefixHarmony;
+            if (args.Length > 2) args[2] = postfixHarmony;
+            if (args.Length > 3) args[3] = null;
+            if (args.Length > 4) args[4] = finalizerHarmony;
+            patchMethod.Invoke(harmony, args);
+        }
+
+        private static void PrepareMaleHairPartsPrefix(object __instance, object __0)
+        {
+            activeMaleHairParts.Clear();
+            if (!enabled || !hairNamesReady || maleHairEntityNames.Count == 0 || !IsFemaleHumanCharacter(__instance))
+                return;
+
+            IDictionary parts = __0 as IDictionary;
+            if (parts == null) return;
+
+            foreach (DictionaryEntry entry in parts)
+            {
+                object entity = entry.Value;
+                if (entity == null || entry.Key == null) continue;
+                object nameValue = ReadMember(entity, "name");
+                string entityName = nameValue == null ? "" : nameValue.ToString();
+                if (maleHairEntityNames.Contains(entityName))
+                    activeMaleHairParts.Add(entry.Key);
+            }
+
+            if (activeMaleHairParts.Count > 0)
+                Log("Preparing female-rig remap for " + activeMaleHairParts.Count + " male-hair body part(s).");
+        }
+
+        private static void ClearActiveMaleHairPartsPostfix()
+        {
+            activeMaleHairParts.Clear();
+        }
+
+        private static Exception ClearActiveMaleHairPartsFinalizer(Exception __exception)
+        {
+            activeMaleHairParts.Clear();
+            return __exception;
+        }
+
+        private static bool RepairMissingHairBonesPrefix(object __instance, object __0,
+            List<Transform> __1, List<Matrix4x4> __2, int[] __3, Dictionary<string, Transform> __4)
+        {
+            if (!enabled || __instance == null || __0 == null ||
+                !activeMaleHairParts.Any(part => object.ReferenceEquals(part, __0)) ||
+                !IsFemaleHumanCharacter(__instance))
+                return true;
+
+            try
+            {
+                object rendererValue = ReadMember(__0, "SkinnedRenderer");
+                SkinnedMeshRenderer renderer = rendererValue as SkinnedMeshRenderer;
+                if (renderer == null || renderer.sharedMesh == null || __4 == null || __4.Count == 0)
+                    return true;
+
+                Transform[] sourceBones = renderer.bones;
+                Matrix4x4[] sourceBindposes = renderer.sharedMesh.bindposes;
+                int count = Math.Min(Math.Min(sourceBones.Length, sourceBindposes.Length), __3.Length);
+                if (count == 0 || sourceBones.Length != sourceBindposes.Length || sourceBones.Length != __3.Length)
+                    return true;
+
+                object animator = ReadMember(__instance, "m_Animator");
+                Transform meshRoot = ReadMember(animator, "transform") as Transform;
+                if (meshRoot == null)
+                    meshRoot = ReadMember(__instance, "transform") as Transform;
+                if (meshRoot == null) return true;
+
+                Transform fallback = FindFallbackHairBone(__4);
+                if (fallback == null) return true;
+
+                // Resolve every mapping before mutating the lists. Exact name matches
+                // keep normal animation; missing male-only hair bones use their nearest
+                // ancestor available on the female rig, preserving the strand's rest shape.
+                Transform[] targets = new Transform[count];
+                int remapped = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    Transform source = sourceBones[i];
+                    Transform target = null;
+                    if (source != null)
+                        __4.TryGetValue(source.name, out target);
+
+                    if (target == null)
+                    {
+                        target = FindNearestExistingAncestor(source, __4);
+                        if (target == null)
+                            target = fallback;
+                        remapped++;
+                    }
+                    targets[i] = target;
+                }
+
+                for (int i = 0; i < count; i++)
+                {
+                    Transform target = targets[i];
+                    Matrix4x4 retargetedBindpose = target.worldToLocalMatrix * meshRoot.localToWorldMatrix;
+                    int mappedIndex = -1;
+
+                    for (int j = 0; j < __1.Count; j++)
+                    {
+                        if (__1[j] == target && __2[j].Equals(retargetedBindpose))
+                        {
+                            mappedIndex = j;
+                            break;
+                        }
+                    }
+
+                    if (mappedIndex < 0)
+                    {
+                        mappedIndex = __1.Count;
+                        __1.Add(target);
+                        __2.Add(retargetedBindpose);
+                    }
+                    __3[i] = mappedIndex;
+                }
+
+                Log("Retargeted male-hair bones; remapped " + remapped + " of " + count + " source bone(s) to the female skeleton.");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                LogError(ex);
+                return true;
+            }
+        }
+
+        private static bool IsFemaleHumanCharacter(object character)
+        {
+            object gender = ReadMember(character, "m_RuntimeGender");
+            object race = ReadMember(character, "m_RuntimeRace");
+            return gender != null && race != null
+                && string.Equals(gender.ToString(), "Female", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(race.ToString(), "Human", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static Transform FindNearestExistingAncestor(Transform source, Dictionary<string, Transform> cachedBones)
+        {
+            for (Transform current = source == null ? null : source.parent; current != null; current = current.parent)
+            {
+                Transform target;
+                if (cachedBones.TryGetValue(current.name, out target) && target != null)
+                    return target;
+            }
+            return null;
+        }
+
+        private static Transform FindFallbackHairBone(Dictionary<string, Transform> cachedBones)
+        {
+            if (cachedBones == null) return null;
+            string[] hints = { "Head", "Neck", "Spine", "Bip001" };
+            foreach (string hint in hints)
+            {
+                foreach (KeyValuePair<string, Transform> pair in cachedBones)
+                {
+                    if (pair.Value != null && string.Equals(pair.Key, hint, StringComparison.OrdinalIgnoreCase))
+                        return pair.Value;
+                }
+            }
+            foreach (string hint in hints)
+            {
+                foreach (KeyValuePair<string, Transform> pair in cachedBones)
+                {
+                    if (pair.Value != null && pair.Key.IndexOf(hint, StringComparison.OrdinalIgnoreCase) >= 0)
+                        return pair.Value;
+                }
+            }
+            return cachedBones.Values.FirstOrDefault(value => value != null);
         }
 
         private static void CacheMaleHairEntityNames(Array maleHair)
